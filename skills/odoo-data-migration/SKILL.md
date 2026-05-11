@@ -5,6 +5,8 @@ description: Use this skill for bulk-loading or migrating data into Odoo via CSV
 
 # Odoo Data Migration
 
+> **STATUS v0.3.0:** Released against Odoo 19 Online deployment. Patterns grounded in: a 200-product catalog migration with lot-tracking flip, 14-vendor consolidation, 3-warehouse collapse with quant migration, Studio-model scaffolding via raw API, and 7-phase idempotent re-runnability. All patterns are deployment-tested.
+
 This skill turns a Schema Decision Record (SDR) into actual records inside an
 Odoo database. The patterns are grounded in a real catalog migration of
 ~200 products with lot-tracking remediation, a 7-phase plan, and full
@@ -197,7 +199,133 @@ reparented under newly-created company partners in a single pass. The pattern:
 `parent_id` is the company, `is_company=False` on the contact, supplier_rank
 moves to the parent.
 
-## Common gotchas (Odoo 18, current as of late 2025)
+## Multi-warehouse collapse pattern
+
+The mirror image of opening balance loading: when an SDR analysis reveals that
+multiple `stock.warehouse` records were over-modeled (configured in
+anticipation of ops that never materialized), the cleanup is a structured
+4-step sequence. Pattern proven on a 4-warehouse → 1-warehouse collapse with
+6 quants migrated and zero data loss.
+
+### Pre-flight (empirical state check)
+
+```python
+# For each warehouse, count active quants + lifetime pickings
+for wh_id in warehouse_ids:
+    quants = search_records('stock.quant',
+        [['location_id.warehouse_id', '=', wh_id],
+         ['location_id.usage', '=', 'internal'],
+         ['quantity', '!=', 0]])
+    pickings = search_records('stock.picking',
+        [['picking_type_id.warehouse_id', '=', wh_id]],
+        fields=['id'])
+    print(wh_id, len(quants), len(pickings))
+```
+
+Sister warehouses with zero pickings ever AND ≤ a handful of quants are the
+collapse candidates.
+
+### Execution sequence
+
+```
+1. Migrate quants from sister WH internal locations → primary WH equivalents
+   - For each non-zero quant: stock.quant.write(location_id=<primary_loc_id>)
+   - For zero-quant rows: archive (active=False) or unlink
+
+2. Archive sister warehouses' picking types (stock.picking.type.active=False)
+   - Skipping this step leaves stale picking-type dropdowns in the UI
+
+3. Re-parent any meaningful child locations from sister WH to primary WH
+   - e.g., LDF's drying speed racks become WH/Drying Area/Speed Rack 1..7
+   - Update stock.location.location_id to the new primary parent
+   - Update warehouse_id to match
+
+4. Archive sister stock.warehouse records (active=False)
+   - DO NOT unlink — historical picking references would orphan
+```
+
+### Verification invariants
+
+- All quants now under primary WH (no orphaned `location_id.warehouse_id != primary`)
+- Sister warehouses' `active=False`, but their `id` is preserved for historical lookups
+- Re-parented locations: `location_id.warehouse_id == new_parent.warehouse_id`
+
+This pattern works on Odoo 18 and 19. On 19, `stock.warehouse.archive()` is
+the standard method; on 18, `write({'active': False})` is equivalent.
+
+---
+
+## Studio scaffolding via raw API
+
+When the SDR calls for custom Studio fields or models AND the deployment is
+Odoo Online (forbidding custom modules), you can scaffold Studio assets
+programmatically via the `ir.model` / `ir.model.fields` / `ir.model.access`
+models. Faster than clicking through Studio UI for large field sets, and
+the operations are version-controllable.
+
+### Creating a Studio model
+
+```python
+# 1. Create the model
+model = create_record('ir.model', {
+    'name': 'Heron Drive Ingest State',
+    'model': 'x_heron_drive_ingest_state',  # MUST start with 'x_'
+    'state': 'manual',                       # Studio-equivalent
+})
+# Odoo auto-creates default fields: id, create_date, create_uid,
+# write_date, write_uid, display_name, x_name
+
+# 2. Create custom fields (parallel-able)
+create_records('ir.model.fields', [
+    {'name': 'x_drive_file_id', 'model_id': model['id'],
+     'ttype': 'char', 'field_description': 'Drive File ID',
+     'state': 'manual', 'store': True, 'required': True},
+    # ... more fields
+])
+
+# 3. Create ACLs (required — model is inaccessible without them)
+create_record('ir.model.access', {
+    'name': 'x_heron_drive_ingest_state inventory admin',
+    'model_id': model['id'],
+    'group_id': <admin_group_id>,
+    'perm_read': True, 'perm_write': True,
+    'perm_create': True, 'perm_unlink': True,
+})
+# Recommend a parallel internal-user read ACL (group_id=1) so the model is
+# queryable from any logged-in session.
+```
+
+### Adding fields to an existing model
+
+Same pattern, but `model_id` points to an existing `ir.model` record:
+
+```python
+create_records('ir.model.fields', [
+    {'name': 'x_coa_status', 'model_id': <stock_lot_model_id>,
+     'ttype': 'selection',
+     'selection': "[('pending','Pending'),('received','Received'),"
+                  "('released','Released'),('rejected','Rejected')]",
+     'field_description': 'CoA Status', 'state': 'manual', 'store': True},
+    {'name': 'x_coa_attachment_id', 'model_id': <stock_lot_model_id>,
+     'ttype': 'many2one', 'relation': 'ir.attachment',
+     'field_description': 'CoA Attachment', 'state': 'manual', 'store': True},
+])
+```
+
+### Caveats
+
+| Caveat | Workaround |
+|---|---|
+| `state='manual'` is required for Studio-style fields | Without it, the field is treated as a custom-module declaration and won't render in Studio UI |
+| Model + field names MUST start with `x_` | Odoo enforces this; non-prefixed names get rejected silently in some versions |
+| `ir.model.access` cache lag | After raw inserts, ACL grants don't take effect until the registry reloads (next page load OR server-side process restart). MCP sessions that just created the rules can still get 403. Expect this; warn operators. |
+| `selection` field on `ir.model.fields` is a string-encoded list of tuples | NOT a Python list. Format: `"[('a','A'),('b','B')]"` |
+| Studio UI may "discover" your raw-API records after a page reload | They become editable in Studio post-hoc. Good — single source of truth. |
+| Model unlink is dangerous | Once data is in your custom model, archiving is preferred over unlinking |
+
+---
+
+## Common gotchas (Odoo 18-19, current as of mid-2026)
 
 | Gotcha | Symptom | Fix |
 |---|---|---|
@@ -209,6 +337,11 @@ moves to the parent.
 | Sample/retail vendor quotes pollute cost basis | `standard_price` set to a $5 retail listing | Filter source data: `is_sample=True` and retail-aggregator vendors → cost basis only or chatter-only, not supplierinfo |
 | Vendor extraction from free-text "notes" columns | ~50% of source rows have no parseable vendor | Insist on a structured vendor column in future intake sheets; what you can't extract goes to cost basis only |
 | Test orders block lot-flips | Stragglers from QA / smoke testing | Establish a "test orders are canceled before any go-live" convention with the SPoC |
+| Odoo 19 `create()` returns a list for single-dict input | `int()` cast on result raises `TypeError: list` | Normalize: `int(result[0] if isinstance(result, list) else result)`. Same for `message_post()`. |
+| Odoo 19 `res.groups.users` field renamed | `Invalid field 'users' in 'res.groups'` | Use `user_ids` (m2m) on 19; `users` still works on 18. |
+| Odoo 19 `ir.filters.user_id` renamed | `Invalid field 'user_id' in 'ir.filters'` | Use `user_ids` (m2m) on 19; or omit (defaults to "all users"). |
+| ACL cache doesn't refresh after raw `ir.model.access` create | 403 on read even with correct grants | Wait for next process reload OR page refresh. Don't fight it during migration; smoke-test in a later session. |
+| `stock.location` doesn't have a `comment` field | `Invalid field 'comment' in 'stock.location'` | Use chatter (`message_post`) for location-level notes, not a field. |
 
 ## Cost basis selection rule
 
@@ -263,3 +396,10 @@ This skill produces validated payloads. The actual writes to Odoo go through
   Phase 1–7 import, with exact payload shapes and verification queries
 - `references/lot-tracking-flip-runbook.md` — Option A in full, including
   the test-order cleanup sequence
+
+## Revision history
+
+| Version | Date | Changes |
+|---|---|---|
+| v0.3.0 | 2026-05-11 | Add Multi-warehouse collapse pattern. Add Studio scaffolding via raw API (ir.model / ir.model.fields / ir.model.access). Add Odoo 19 quirks: list-returns on create/message_post, res.groups.user_ids rename, ir.filters.user_ids rename, ACL cache lag. Update header range to Odoo 18-19, mid-2026. |
+| v0.2.1 | 2025-late | Lot-tracking flip Option A runbook, vendor consolidation pattern, 7-phase plan template. |
