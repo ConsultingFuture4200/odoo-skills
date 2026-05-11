@@ -5,10 +5,13 @@ description: Use this skill to set up authenticated, idempotent communication wi
 
 # Odoo Connect
 
+> **STATUS v0.3.0:** Released against Odoo 19 Online. Adds a working JSON-RPC client reference implementation (proven on two production services), a three-mode auth pattern for Google-service-account–style integrations, and Odoo 19 transport quirks.
+
 The plumbing layer underneath every other skill in this family. Three transport
 choices with different trade-offs; pick once, use everywhere. The patterns
 below are grounded in a real catalog migration that used the Odoo MCP
-transport against an Odoo Online instance.
+transport against an Odoo Online instance, plus two production Python services
+(`heron-bom-autobuild`, `heron-drive-ingest`) running JSON-RPC against the same.
 
 ## When to use this skill
 
@@ -192,6 +195,152 @@ to avoid silent cross-company reads.
 - You own the upgrade cadence — both a feature and a footgun
 - Backup/restore is your problem; test it
 
+## Reference JSON-RPC client (Python)
+
+A minimum-viable Odoo JSON-RPC client. ~120 lines, no dependencies beyond
+`requests`. Tested against Odoo 18 and 19 Online. Both
+`heron-bom-autobuild` and `heron-drive-ingest` use this exact shape.
+
+```python
+import os
+from dataclasses import dataclass
+from typing import Any
+
+
+class OdooRPCError(RuntimeError):
+    """Raised when the Odoo server returns an error envelope."""
+
+
+@dataclass
+class OdooClient:
+    url: str
+    db: str
+    username: str
+    api_key: str
+    timeout: float = 60.0
+    _uid: int | None = None
+
+    @classmethod
+    def from_env(cls) -> "OdooClient":
+        url = os.environ.get("ODOO_URL", "").rstrip("/")
+        db = os.environ.get("ODOO_DB", "")
+        username = os.environ.get("ODOO_USER", "")
+        api_key = os.environ.get("ODOO_API_KEY", "")
+        missing = [k for k, v in {
+            "ODOO_URL": url, "ODOO_DB": db,
+            "ODOO_USER": username, "ODOO_API_KEY": api_key,
+        }.items() if not v]
+        if missing:
+            raise RuntimeError(f"OdooClient.from_env: missing env vars: {', '.join(missing)}")
+        return cls(url=url, db=db, username=username, api_key=api_key)
+
+    def _post(self, payload: dict) -> Any:
+        import requests
+        resp = requests.post(f"{self.url}/jsonrpc", json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("error"):
+            raise OdooRPCError(f"Odoo RPC error: {body['error']}")
+        return body.get("result")
+
+    def _authenticate(self) -> int:
+        if self._uid is not None:
+            return self._uid
+        result = self._post({
+            "jsonrpc": "2.0", "method": "call",
+            "params": {"service": "common", "method": "authenticate",
+                       "args": [self.db, self.username, self.api_key, {}]},
+        })
+        if not result:
+            raise OdooRPCError("authentication failed: check user + api_key")
+        self._uid = int(result)
+        return self._uid
+
+    def execute_kw(self, model: str, method: str, args: list, kwargs: dict | None = None) -> Any:
+        uid = self._authenticate()
+        return self._post({
+            "jsonrpc": "2.0", "method": "call",
+            "params": {"service": "object", "method": "execute_kw",
+                       "args": [self.db, uid, self.api_key, model, method, args, kwargs or {}]},
+        })
+
+    def search_read(self, model: str, domain: list, fields: list[str] | None = None,
+                    limit: int = 0, offset: int = 0, order: str | None = None) -> list[dict]:
+        kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
+        if fields is not None: kwargs["fields"] = fields
+        if order is not None: kwargs["order"] = order
+        return self.execute_kw(model, "search_read", [domain], kwargs)
+
+    def create(self, model: str, vals: dict | list[dict]) -> int | list[int]:
+        # Odoo 19 normalizes create() to return a list even for single-dict input.
+        # Older versions returned a bare int; handle both.
+        if isinstance(vals, dict):
+            result = self.execute_kw(model, "create", [vals])
+            return int(result[0] if isinstance(result, list) else result)
+        return [int(x) for x in self.execute_kw(model, "create", [vals])]
+
+    def message_post(self, model: str, record_id: int, body: str,
+                     subtype_xmlid: str = "mail.mt_note") -> int:
+        result = self.execute_kw(
+            model, "message_post", [record_id],
+            {"body": body, "subtype_xmlid": subtype_xmlid},
+        )
+        return int(result[0] if isinstance(result, list) else result)
+```
+
+### Notes
+
+- Single instance is single-connection. For high-throughput services,
+  pool 4-8 clients. Authentication is cached per-instance, so reuse.
+- `from_env` is the standard factory. `.env` files via `python-dotenv` or
+  shell sourcing both work; the client just reads `os.environ`.
+- For multi-company contexts, add `context={"allowed_company_ids": [...]}`
+  to the `execute_kw` kwargs. Default is the user's main company.
+
+## Multi-mode auth pattern (for Google-style integrations)
+
+When the same service needs to talk to BOTH Odoo (via API key) AND a Google
+API (via service account / ADC / OAuth refresh token), keep the auth modules
+parallel. Pattern from `heron-drive-ingest`:
+
+```python
+def get_credentials(scopes: list[str]):
+    """Pick auth source by env var. SA > ADC > user OAuth refresh."""
+    sa_path = os.environ.get("DRIVE_SA_PATH", "")
+    if sa_path and Path(sa_path).exists():
+        from google.oauth2.service_account import Credentials
+        return Credentials.from_service_account_file(sa_path, scopes=scopes)
+
+    if os.environ.get("USE_ADC", "").lower() in {"1", "true", "yes"}:
+        import google.auth
+        creds, _ = google.auth.default(scopes=scopes)
+        return creds
+
+    if os.environ.get("USE_RCLONE_CONFIG", "").lower() in {"1", "true", "yes"}:
+        return _credentials_from_rclone_config()  # user OAuth refresh, stopgap
+
+    raise RuntimeError("No auth method configured.")
+```
+
+The fallback hierarchy matters when Google Workspace org policies block
+service-account key creation (`iam.disableServiceAccountKeyCreation`). The
+production target is SA; ADC works when the OAuth client advertises the
+right scopes; user-OAuth refresh from `rclone` config is a development
+stopgap that ties to one user account. Document the path-to-production in
+the project's SDR.
+
+## Odoo 19 transport quirks
+
+| Quirk | Surface | Workaround |
+|---|---|---|
+| `create()` returns a list for single-dict input | `TypeError: int() argument` | `int(result[0] if isinstance(result, list) else result)` |
+| `message_post()` returns a list | Same | Same |
+| `res.groups.users` renamed to `user_ids` | `Invalid field 'users'` | Use `user_ids` on 19; both work via fallback `vals.get('user_ids', vals.get('users'))` |
+| `ir.filters.user_id` renamed to `user_ids` | `Invalid field 'user_id'` | Same pattern |
+| Studio model ACL cache lag | 403 after creating `ir.model.access` | Wait for process reload; not a code fix |
+
+Full list in `odoo-data-migration`'s gotcha table.
+
 ## Hand-off
 
 Once `server_info()` returns `connected: true` and the smoke-test read
@@ -206,4 +355,11 @@ succeeds, hand off to:
 
 - `references/mcp-client-patterns.md` — MCP usage patterns
   (find_skill, smart field selection, batch helpers)
-- Odoo official RPC docs: <https://www.odoo.com/documentation/18.0/developer/reference/external_api.html>
+- Odoo official RPC docs: <https://www.odoo.com/documentation/19.0/developer/reference/external_api.html>
+
+## Revision history
+
+| Version | Date | Changes |
+|---|---|---|
+| v0.3.0 | 2026-05-11 | Add reference JSON-RPC client (Python) — 120-line OdooClient proven on two production services. Add multi-mode auth pattern for Google-style integrations (SA > ADC > user OAuth fallback). Add Odoo 19 transport quirks section. Bump RPC docs link to 19.0. |
+| v0.2.1 | 2025-late | Three-transport overview (MCP/JSON-RPC/XML-RPC), external-ID upsert, batch sizing, error patterns. |
